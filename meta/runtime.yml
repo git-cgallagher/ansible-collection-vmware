@@ -1,0 +1,8 @@
+---
+requires_ansible: '>=2.18.0'
+# module_defaults group: `group/git_cgallagher.vmware.vsphere` sets the
+# connection options for every module in the collection at once.
+action_groups:
+  vsphere:
+    - vm_disk
+    - vm_disk_info

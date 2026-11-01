@@ -1,0 +1,53 @@
+---
+# Molecule runs this twice: the second run (idempotence) must change nothing.
+- name: Lay down the SQL Server disk layout on both nodes, from node1
+  hosts: nodes
+  gather_facts: false
+  module_defaults:
+    group/git_cgallagher.vmware.vsphere: "{{ vsphere }}"
+  tasks:
+    - name: Per-node data, log and tempdb disks
+      git_cgallagher.vmware.vm_disk:
+        name: "{{ item.0.value }}"
+        controller_type: paravirtual
+        controller_number: 1
+        unit_number: "{{ item.1.unit_number }}"
+        size_gb: "{{ item.1.size_gb }}"
+        type: thick
+      loop: "{{ sql_nodes | dict2items | product(sql_node_disks) | list }}"
+      loop_control:
+        label: "{{ item.0.key }} {{ item.1.name }}"
+      register: vmware_node_disks
+
+    # The first node creates each shared VMDK; the others find it and attach
+    # it, through the same task. Serial by design: a node must see the file
+    # the previous one created.
+    - name: Shared cluster disks
+      git_cgallagher.vmware.vm_disk:
+        name: "{{ item.0.value }}"
+        controller_type: paravirtual
+        controller_number: 2
+        controller_bus_sharing: physical
+        unit_number: "{{ item.1.unit_number }}"
+        filename: "{{ sql_shared_folder }}/{{ item.1.name }}.vmdk"
+        size_gb: "{{ item.1.size_gb }}"
+        type: eagerzeroedthick
+        disk_mode: independent_persistent
+        sharing: multi_writer
+      loop: "{{ sql_nodes | dict2items | product(sql_shared_disks) | list }}"
+      loop_control:
+        label: "{{ item.0.key }} {{ item.1.name }}"
+      register: vmware_shared_disks
+
+    # True after the first run and after the idempotence run alike.
+    - name: Check the results
+      ansible.builtin.assert:
+        that:
+          - vmware_node_disks.results | map(attribute='disk.type') | unique | list == ['thick']
+          - vmware_node_disks.results | map(attribute='disk.controller_number') | unique | list == [1]
+          - vmware_shared_disks.results | map(attribute='disk.controller_bus_sharing') | unique | list == ['physical']
+          - vmware_shared_disks.results | map(attribute='disk.sharing') | unique | list == ['multi_writer']
+          - vmware_shared_disks.results | map(attribute='disk.disk_mode') | unique | list == ['independent_persistent']
+        fail_msg: >-
+          Unexpected disks: {{ vmware_node_disks.results | map(attribute='disk') | list }}
+          {{ vmware_shared_disks.results | map(attribute='disk') | list }}

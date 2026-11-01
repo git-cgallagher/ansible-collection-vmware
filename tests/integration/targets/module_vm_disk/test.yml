@@ -1,0 +1,630 @@
+---
+# The vm_disk module against vcsim. vcsim's stock inventory: datacenter DC0,
+# datastore LocalDS_0, VMs DC0_H0_VM0 and DC0_H0_VM1 (one thin 10 GiB disk each
+# on paravirtual controller 0, powered on). VM1 is powered off below for the
+# changes that need it. vmctl.py (../setup_vcsim/files/vmctl.py) is the only thing here
+# that isn't the module: it powers VMs on and off and lists datastore folders.
+- name: Test git_cgallagher.vmware.vm_disk against vcsim
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # The module runs through the local connection; use the controller's Python, which has pyvmomi.
+    ansible_python_interpreter: '{{ ansible_playbook_python }}'
+    vcsim:
+      hostname: '{{ lookup("env", "VCSIM_HOST") }}'
+      port: '{{ lookup("env", "VCSIM_PORT") | int }}'
+      username: '{{ lookup("env", "VCSIM_USER") }}'
+      password: '{{ lookup("env", "VCSIM_PASSWORD") }}'
+      validate_certs: false
+    vm_on: DC0_H0_VM0
+    vm_off: DC0_H0_VM1
+    quorum: '[LocalDS_0] sqlfci/quorum.vmdk'
+    vmctl: '{{ ansible_playbook_python }} ../setup_vcsim/files/vmctl.py'
+  module_defaults:
+    group/git_cgallagher.vmware.vsphere: '{{ vcsim }}'
+  tasks:
+    - name: Power off the second node, {{ vm_off }}
+      ansible.builtin.command: '{{ vmctl }} power off {{ vm_off }}'
+      changed_when: true
+
+    - name: Read the stock disks
+      git_cgallagher.vmware.vm_disk_info:
+        name: '{{ vm_on }}'
+      register: stock
+
+    - name: Check the stock inventory is what the tests assume
+      ansible.builtin.assert:
+        that:
+          - stock.disks | length == 1
+          - stock.disks[0].controller_type == 'paravirtual'
+          - stock.disks[0].controller_number == 0
+          - stock.disks[0].unit_number == 0
+          - stock.vm.power_state == 'poweredOn'
+
+    # ------------------------------------------------------------ create, idempotence, check mode
+    - name: Preview a data disk on a new controller
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 1
+        unit_number: 0
+        size_gb: 20
+        type: thick
+      check_mode: true
+      register: preview
+
+    - name: Read the disks after the preview
+      git_cgallagher.vmware.vm_disk_info:
+        name: '{{ vm_on }}'
+      register: after_preview
+
+    - name: Check mode predicts and writes nothing
+      ansible.builtin.assert:
+        that:
+          - preview is changed
+          - preview.changes == ['add_controller', 'create_disk']
+          - preview.disk.controller_number == 1
+          - preview.disk.unit_number == 0
+          - preview.disk.size_gb == 20
+          - preview.disk.type == 'thick'
+          - preview.disk.datastore == 'LocalDS_0'
+          - preview.disk.key is none
+          - after_preview.disks | length == 1
+          - after_preview.controllers | selectattr('bus_number', 'equalto', 1) | list | length == 0
+
+    - name: Create the data disk (hot-add on a running VM)
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 1
+        unit_number: 0
+        size_gb: 20
+        type: thick
+      register: data
+
+    - name: Create the data disk again
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 1
+        unit_number: 0
+        size_gb: 20
+        type: thick
+      register: data_again
+
+    - name: Check the create and its idempotence
+      ansible.builtin.assert:
+        that:
+          - data is changed
+          - data.changes == ['add_controller', 'create_disk']
+          - data.disk.key is number
+          - data.disk.label is string
+          - data.disk.uuid is string
+          - data.disk.controller_type == 'paravirtual'
+          - data.disk.controller_number == 1
+          - data.disk.controller_bus_sharing == 'nosharing'
+          - data.disk.unit_number == 0
+          - data.disk.size_gb == 20
+          - data.disk.size_kb == 20971520
+          - data.disk.type == 'thick'
+          - data.disk.disk_mode == 'persistent'
+          - data.disk.sharing == 'nosharing'
+          - data.disk.datastore == 'LocalDS_0'
+          - data.disk.filename is match('\[LocalDS_0\] ')
+          - data.vm.name == vm_on
+          - data_again is not changed
+          - data_again.changes == []
+          - data_again.disk == data.disk
+
+    - name: Create a thin log disk on the same controller
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 1
+        unit_number: 1
+        size_gb: 10
+      register: log
+
+    - name: Check the second disk only added a disk
+      ansible.builtin.assert:
+        that:
+          - log is changed
+          - log.changes == ['create_disk']
+          - log.disk.type == 'thin'
+          - log.disk.unit_number == 1
+
+    # ------------------------------------------------------------ grow, shrink
+    - name: Preview growing the log disk
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 1
+        unit_number: 1
+        size_gb: 15
+      check_mode: true
+      register: grow_preview
+
+    - name: Grow the log disk
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 1
+        unit_number: 1
+        size_gb: 15
+      register: grow
+
+    - name: Grow it again
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 1
+        unit_number: 1
+        size_gb: 15
+      register: grow_again
+
+    - name: Try to shrink it
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 1
+        unit_number: 1
+        size_gb: 5
+      register: shrink
+      ignore_errors: true
+
+    - name: Check grow and shrink
+      ansible.builtin.assert:
+        that:
+          - grow_preview is changed
+          - grow_preview.changes == ['grow']
+          - grow_preview.disk.size_gb == 15
+          - grow is changed
+          - grow.changes == ['grow']
+          - grow.disk.size_gb == 15
+          - grow.disk.key == log.disk.key
+          - grow_again is not changed
+          - shrink is failed
+          - "'cannot shrink' in shrink.msg"
+          - shrink.disk.size_gb == 15
+
+    # ------------------------------------------------------------ what vSphere refuses, caught up front
+    - name: Ask for things vSphere would refuse
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_type: '{{ item.controller_type | default("paravirtual") }}'
+        controller_number: '{{ item.controller_number | default(1) }}'
+        controller_bus_sharing: '{{ item.controller_bus_sharing | default(omit) }}'
+        unit_number: '{{ item.unit_number | default(omit) }}'
+        filename: '{{ item.filename | default(omit) }}'
+        size_gb: '{{ item.size_gb | default(omit) }}'
+        type: '{{ item.type | default(omit) }}'
+        disk_mode: '{{ item.disk_mode | default(omit) }}'
+      loop:
+        - {unit_number: 7, expect: 'reserved'}
+        - {unit_number: 16, expect: 'between 0 and 15'}
+        - {unit_number: -1, expect: 'between 0 and 15'}
+        - {controller_number: 4, unit_number: 0, expect: 'between 0 and 3'}
+        - {controller_type: sata, unit_number: 30, expect: 'between 0 and 29'}
+        - {controller_type: sata, controller_bus_sharing: physical, unit_number: 0, expect: 'only applies to SCSI'}
+        - {unit_number: 0, type: thin, expect: 'cannot be converted'}
+        - {unit_number: 0, disk_mode: independent_persistent, expect: 'powered off'}
+        - {unit_number: 3, size_gb: 0, expect: 'at least 1'}
+        - {expect: 'unit_number, filename'}
+      loop_control:
+        label: '{{ item.expect }}'
+      register: refused
+      ignore_errors: true
+
+    - name: Check every one failed with the expected message
+      ansible.builtin.assert:
+        that:
+          - item is failed
+          - item.item.expect in item.msg
+        fail_msg: '{{ item.item }} -> {{ item.msg | default(item) }}'
+      loop: '{{ refused.results }}'
+      loop_control:
+        label: '{{ item.item.expect }}'
+
+    - name: Create a disk without a size
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 1
+        unit_number: 3
+      register: no_size
+      ignore_errors: true
+
+    - name: Read the disks after the refusals
+      git_cgallagher.vmware.vm_disk_info:
+        name: '{{ vm_on }}'
+      register: after_refusals
+
+    - name: Check nothing was created by the refused tasks
+      ansible.builtin.assert:
+        that:
+          - no_size is failed
+          - "'size_gb is required' in no_size.msg"
+          - after_refusals.disks | length == 3
+          - after_refusals.disks | map(attribute='disk_mode') | unique | list == ['persistent']
+
+    # ------------------------------------------------------------ a shared disk between two VMs
+    - name: Preview the quorum disk on the powered-off node
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_off }}'
+        controller_number: 2
+        controller_bus_sharing: physical
+        unit_number: 0
+        filename: '{{ quorum }}'
+        size_gb: 2
+        type: eagerzeroedthick
+        disk_mode: independent_persistent
+        sharing: multi_writer
+      check_mode: true
+      register: quorum_preview
+
+    - name: List the quorum folder after the preview
+      ansible.builtin.command: '{{ vmctl }} ls LocalDS_0 sqlfci'
+      changed_when: false
+      register: folder_after_preview
+
+    - name: Check mode did not create the folder or the file
+      ansible.builtin.assert:
+        that:
+          - quorum_preview is changed
+          - quorum_preview.changes == ['add_controller', 'create_disk']
+          - quorum_preview.disk.filename == quorum
+          - quorum_preview.disk.controller_bus_sharing == 'physical'
+          - quorum_preview.disk.sharing == 'multi_writer'
+          - quorum_preview.disk.disk_mode == 'independent_persistent'
+          - folder_after_preview.stdout == ''
+
+    - name: Create the quorum disk on the powered-off node
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_off }}'
+        controller_number: 2
+        controller_bus_sharing: physical
+        unit_number: 0
+        filename: '{{ quorum }}'
+        size_gb: 2
+        type: eagerzeroedthick
+        disk_mode: independent_persistent
+        sharing: multi_writer
+      register: quorum_created
+
+    - name: Create it again
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_off }}'
+        controller_number: 2
+        controller_bus_sharing: physical
+        unit_number: 0
+        filename: '{{ quorum }}'
+        size_gb: 2
+        type: eagerzeroedthick
+        disk_mode: independent_persistent
+        sharing: multi_writer
+      register: quorum_again
+
+    - name: List the quorum folder
+      ansible.builtin.command: '{{ vmctl }} ls LocalDS_0 sqlfci'
+      changed_when: false
+      register: folder
+
+    - name: Check the shared disk was created where asked
+      ansible.builtin.assert:
+        that:
+          - quorum_created is changed
+          - quorum_created.changes == ['add_controller', 'create_folder', 'create_disk']
+          - quorum_created.disk.filename == quorum
+          - quorum_created.disk.type == 'eagerzeroedthick'
+          - quorum_created.disk.controller_bus_sharing == 'physical'
+          - quorum_created.disk.sharing == 'multi_writer'
+          - quorum_created.disk.disk_mode == 'independent_persistent'
+          - quorum_created.disk.size_gb == 2
+          - quorum_created.disk.uuid is string
+          - quorum_again is not changed
+          - "'quorum.vmdk' in folder.stdout_lines"
+
+    - name: Attach the quorum disk to the running node by file, first free unit
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 2
+        controller_bus_sharing: physical
+        filename: '{{ quorum }}'
+        size_gb: 2
+        type: eagerzeroedthick
+        disk_mode: independent_persistent
+        sharing: multi_writer
+      register: attached
+
+    - name: Attach it again
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 2
+        controller_bus_sharing: physical
+        filename: '{{ quorum }}'
+        size_gb: 2
+        type: eagerzeroedthick
+        disk_mode: independent_persistent
+        sharing: multi_writer
+      register: attached_again
+
+    - name: Attach it again, by slot this time
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 2
+        unit_number: 0
+        filename: '{{ quorum }}'
+      register: attached_by_slot
+
+    - name: Check the attach found the existing file and both VMs share it
+      ansible.builtin.assert:
+        that:
+          - attached is changed
+          - attached.changes == ['add_controller', 'attach_disk']
+          - attached.disk.unit_number == 0
+          - attached.disk.uuid == quorum_created.disk.uuid
+          - attached.disk.filename == quorum
+          - attached.disk.type == 'eagerzeroedthick'
+          - attached.disk.size_gb == 2
+          - attached_again is not changed
+          - attached_by_slot is not changed
+
+    - name: Ask for the shared slot with another file, and the shared file at another slot
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 2
+        unit_number: '{{ item.unit_number }}'
+        filename: '{{ item.filename }}'
+        size_gb: 2
+      loop:
+        - {unit_number: 0, filename: '[LocalDS_0] sqlfci/other.vmdk', expect: 'holds'}
+        - {unit_number: 1, filename: '{{ quorum }}', expect: 'already attached'}
+      loop_control:
+        label: '{{ item.expect }}'
+      register: conflicts
+      ignore_errors: true
+
+    - name: Check the conflicts were refused
+      ansible.builtin.assert:
+        that:
+          - item is failed
+          - item.item.expect in item.msg
+        fail_msg: '{{ item.item }} -> {{ item.msg | default(item) }}'
+      loop: '{{ conflicts.results }}'
+      loop_control:
+        label: '{{ item.item.expect }}'
+
+    # ------------------------------------------------------------ changes that need the VM powered off
+    - name: Preview a disk mode change on the powered-off node
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_off }}'
+        controller_number: 2
+        unit_number: 0
+        disk_mode: persistent
+      check_mode: true
+      register: mode_preview
+
+    - name: Change the disk mode, sharing and bus sharing on the powered-off node
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_off }}'
+        controller_number: 2
+        controller_bus_sharing: virtual
+        unit_number: 0
+        disk_mode: persistent
+        sharing: nosharing
+      register: mode_changed
+
+    - name: Change them back
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_off }}'
+        controller_number: 2
+        controller_bus_sharing: physical
+        unit_number: 0
+        disk_mode: independent_persistent
+        sharing: multi_writer
+      register: mode_restored
+
+    - name: Try the bus sharing change on the running node
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 2
+        controller_bus_sharing: virtual
+        unit_number: 0
+      register: bus_on_running
+      ignore_errors: true
+
+    - name: Try the sharing change on the running node
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 2
+        unit_number: 0
+        sharing: nosharing
+      register: sharing_on_running
+      ignore_errors: true
+
+    - name: Check the powered-off changes and the powered-on refusals
+      ansible.builtin.assert:
+        that:
+          - mode_preview is changed
+          - mode_preview.changes == ['set_disk_mode']
+          - mode_preview.disk.disk_mode == 'persistent'
+          - mode_changed is changed
+          - mode_changed.changes == ['set_controller_bus_sharing', 'set_disk_mode', 'set_sharing']
+          - mode_changed.disk.disk_mode == 'persistent'
+          - mode_changed.disk.sharing == 'nosharing'
+          - mode_changed.disk.controller_bus_sharing == 'virtual'
+          - mode_restored is changed
+          - mode_restored.disk.disk_mode == 'independent_persistent'
+          - mode_restored.disk.sharing == 'multi_writer'
+          - mode_restored.disk.controller_bus_sharing == 'physical'
+          - bus_on_running is failed
+          - "'powered off' in bus_on_running.msg"
+          - sharing_on_running is failed
+          - "'powered off' in sharing_on_running.msg"
+
+    # ------------------------------------------------------------ SATA and NVMe
+    - name: Create disks on SATA and NVMe controllers
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_type: '{{ item }}'
+        controller_number: 0
+        unit_number: 0
+        size_gb: 5
+      loop: [sata, nvme]
+      register: other_controllers
+
+    - name: Check the SATA and NVMe disks
+      ansible.builtin.assert:
+        that:
+          - item is changed
+          - item.changes == ['add_controller', 'create_disk']
+          - item.disk.controller_type == item.item
+          - item.disk.controller_bus_sharing is none
+          - item.disk.size_gb == 5
+      loop: '{{ other_controllers.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+
+    # ------------------------------------------------------------ finding the VM
+    - name: Find the VM by moid, uuid and instance uuid
+      git_cgallagher.vmware.vm_disk:
+        moid: '{{ item.moid | default(omit) }}'
+        uuid: '{{ item.uuid | default(omit) }}'
+        use_instance_uuid: '{{ item.use_instance_uuid | default(omit) }}'
+        datacenter: '{{ item.datacenter | default(omit) }}'
+        controller_number: 1
+        unit_number: 0
+        size_gb: 20
+      loop:
+        - {moid: '{{ stock.vm.moid }}'}
+        - {uuid: '{{ stock.vm.uuid }}'}
+        - {uuid: '{{ stock.vm.instance_uuid }}', use_instance_uuid: true}
+        - {moid: '{{ stock.vm.moid }}', datacenter: DC0}
+      loop_control:
+        label: '{{ item }}'
+      register: by_id
+
+    - name: Look for VMs that do not exist
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ item.name | default(omit) }}'
+        uuid: '{{ item.uuid | default(omit) }}'
+        moid: '{{ item.moid | default(omit) }}'
+        datacenter: '{{ item.datacenter | default(omit) }}'
+        controller_number: 1
+        unit_number: 0
+        size_gb: 20
+      loop:
+        - {name: no-such-vm, expect: 'name=no-such-vm not found'}
+        - {uuid: 00000000-0000-0000-0000-000000000000, expect: 'not found'}
+        - {moid: vm-999999, expect: 'moid=vm-999999 not found'}
+        - {name: '{{ vm_on }}', datacenter: no-such-dc, expect: 'Datacenter'}
+      loop_control:
+        label: '{{ item.expect }}'
+      register: not_found
+      ignore_errors: true
+
+    - name: Connect to a port nothing listens on
+      git_cgallagher.vmware.vm_disk:
+        hostname: 127.0.0.1
+        port: 1
+        name: '{{ vm_on }}'
+        controller_number: 1
+        unit_number: 0
+        size_gb: 20
+      register: bad_port
+      ignore_errors: true
+
+    - name: Check the lookups
+      ansible.builtin.assert:
+        that:
+          - by_id.results | map(attribute='changed') | list == [false, false, false, false]
+          - by_id.results | map(attribute='vm.name') | unique | list == [vm_on]
+          - not_found.results | map(attribute='failed') | list == [true, true, true, true]
+          - bad_port is failed
+          - "'Connecting to 127.0.0.1:1 failed' in bad_port.msg"
+
+    - name: Check the not-found messages
+      ansible.builtin.assert:
+        that:
+          - item.item.expect in item.msg
+        fail_msg: '{{ item.item }} -> {{ item.msg }}'
+      loop: '{{ not_found.results }}'
+      loop_control:
+        label: '{{ item.item.expect }}'
+
+    # ------------------------------------------------------------ absent
+    - name: Preview detaching the shared disk from the running node
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 2
+        unit_number: 0
+        state: absent
+      check_mode: true
+      register: detach_preview
+
+    - name: Detach the shared disk from the running node, keeping the file
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 2
+        unit_number: 0
+        state: absent
+      register: detached
+
+    - name: Detach it again
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_number: 2
+        unit_number: 0
+        state: absent
+      register: detached_again
+
+    - name: List the quorum folder after the detach
+      ansible.builtin.command: '{{ vmctl }} ls LocalDS_0 sqlfci'
+      changed_when: false
+      register: folder_after_detach
+
+    - name: Remove the quorum disk from the other node, file included
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_off }}'
+        filename: '{{ quorum }}'
+        state: absent
+        delete_file: true
+      register: deleted
+
+    - name: List the quorum folder after the delete
+      ansible.builtin.command: '{{ vmctl }} ls LocalDS_0 sqlfci'
+      changed_when: false
+      register: folder_after_delete
+
+    - name: Remove the other test disks
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm_on }}'
+        controller_type: '{{ item.controller_type | default("paravirtual") }}'
+        controller_number: '{{ item.controller_number | default(1) }}'
+        unit_number: '{{ item.unit_number }}'
+        state: absent
+        delete_file: true
+      loop:
+        - {unit_number: 0}
+        - {unit_number: 1}
+        - {controller_type: sata, controller_number: 0, unit_number: 0}
+        - {controller_type: nvme, controller_number: 0, unit_number: 0}
+      register: cleanup
+
+    - name: Read the disks at the end
+      git_cgallagher.vmware.vm_disk_info:
+        name: '{{ vm_on }}'
+      register: final
+
+    - name: Check the removals
+      ansible.builtin.assert:
+        that:
+          - detach_preview is changed
+          - detach_preview.changes == ['remove_disk']
+          - detach_preview.disk == {}
+          - detached is changed
+          - detached.changes == ['remove_disk']
+          - detached.removed_disk.filename == quorum
+          - detached_again is not changed
+          - "'quorum.vmdk' in folder_after_detach.stdout_lines"
+          - deleted is changed
+          - deleted.changes == ['remove_disk', 'delete_file']
+          - "'quorum.vmdk' not in folder_after_delete.stdout_lines"
+          - cleanup.results | map(attribute='changed') | list == [true, true, true, true]
+          - final.disks | length == 1
+          - final.disks[0].key == stock.disks[0].key
+
+    - name: Power the other node back on, {{ vm_off }}
+      ansible.builtin.command: '{{ vmctl }} power on {{ vm_off }}'
+      changed_when: true

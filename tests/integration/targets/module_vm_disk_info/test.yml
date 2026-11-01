@@ -1,0 +1,141 @@
+---
+# The vm_disk_info module against vcsim (stock inventory: see ../setup_vcsim/files/with_vcsim.sh).
+- name: Test git_cgallagher.vmware.vm_disk_info against vcsim
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: '{{ ansible_playbook_python }}'
+    vcsim:
+      hostname: '{{ lookup("env", "VCSIM_HOST") }}'
+      port: '{{ lookup("env", "VCSIM_PORT") | int }}'
+      username: '{{ lookup("env", "VCSIM_USER") }}'
+      password: '{{ lookup("env", "VCSIM_PASSWORD") }}'
+      validate_certs: false
+    vm: DC0_H0_VM0
+  module_defaults:
+    group/git_cgallagher.vmware.vsphere: '{{ vcsim }}'
+  tasks:
+    - name: Read the stock VM
+      git_cgallagher.vmware.vm_disk_info:
+        name: '{{ vm }}'
+      register: info
+
+    - name: Read it in check mode
+      git_cgallagher.vmware.vm_disk_info:
+        name: '{{ vm }}'
+      check_mode: true
+      register: info_check
+
+    - name: Check the stock disk and controller
+      ansible.builtin.assert:
+        that:
+          - info is not changed
+          - info_check == info
+          - info.vm.name == vm
+          - info.vm.moid is match('vm-')
+          - info.vm.power_state == 'poweredOn'
+          - info.vm.uuid is string
+          - info.vm.instance_uuid is string
+          - info.disks | length == 1
+          - info.disks[0].key is number
+          - info.disks[0].label is string
+          - info.disks[0].controller_type == 'paravirtual'
+          - info.disks[0].controller_number == 0
+          - info.disks[0].controller_bus_sharing == 'nosharing'
+          - info.disks[0].unit_number == 0
+          - info.disks[0].size_gb == 10
+          - info.disks[0].size_kb == 10485760
+          - info.disks[0].type == 'thin'
+          - info.disks[0].disk_mode == 'persistent'
+          - info.disks[0].sharing == 'nosharing'
+          - info.disks[0].datastore == 'LocalDS_0'
+          - info.disks[0].filename is match('\[LocalDS_0\] ')
+          - info.disks[0].backing == 'FlatVer2BackingInfo'
+          - info.disks[0].uuid is string
+          - info.controllers | length == 1
+          - info.controllers[0].type == 'paravirtual'
+          - info.controllers[0].bus_number == 0
+          - info.controllers[0].bus_sharing == 'nosharing'
+          - info.controllers[0].key == info.disks[0].controller_key
+          - info.disks[0].key in info.controllers[0].devices
+
+    - name: Read the same VM by moid, uuid and instance uuid
+      git_cgallagher.vmware.vm_disk_info:
+        moid: '{{ item.moid | default(omit) }}'
+        uuid: '{{ item.uuid | default(omit) }}'
+        use_instance_uuid: '{{ item.use_instance_uuid | default(omit) }}'
+        datacenter: '{{ item.datacenter | default(omit) }}'
+      loop:
+        - {moid: '{{ info.vm.moid }}'}
+        - {uuid: '{{ info.vm.uuid }}'}
+        - {uuid: '{{ info.vm.instance_uuid }}', use_instance_uuid: true}
+        - {uuid: '{{ info.vm.uuid }}', datacenter: DC0}
+      loop_control:
+        label: '{{ item }}'
+      register: by_id
+
+    - name: Check every lookup found the same VM
+      ansible.builtin.assert:
+        that:
+          - by_id.results | map(attribute='vm.moid') | unique | list == [info.vm.moid]
+          - by_id.results | map(attribute='disks') | map('length') | list == [1, 1, 1, 1]
+
+    - name: Add a disk on a second controller, then read again
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm }}'
+        controller_type: lsilogicsas
+        controller_number: 1
+        controller_bus_sharing: physical
+        unit_number: 2
+        size_gb: 3
+        type: eagerzeroedthick
+        disk_mode: independent_persistent
+        sharing: multi_writer
+      register: added
+
+    - name: Read the VM with two disks
+      git_cgallagher.vmware.vm_disk_info:
+        name: '{{ vm }}'
+      register: two
+
+    - name: Check ordering and that the info matches what vm_disk returned
+      ansible.builtin.assert:
+        that:
+          - two.disks | length == 2
+          - two.disks[0].key == info.disks[0].key
+          - two.disks[1] == added.disk
+          - two.controllers | map(attribute='type') | list == ['lsilogicsas', 'paravirtual']
+          - (two.controllers | selectattr('type', 'equalto', 'lsilogicsas') | first).bus_sharing == 'physical'
+          - (two.controllers | selectattr('type', 'equalto', 'lsilogicsas') | first).bus_number == 1
+
+    - name: Remove the extra disk
+      git_cgallagher.vmware.vm_disk:
+        name: '{{ vm }}'
+        controller_type: lsilogicsas
+        controller_number: 1
+        unit_number: 2
+        state: absent
+        delete_file: true
+
+    - name: Ask about VMs that do not exist, and with bad arguments
+      git_cgallagher.vmware.vm_disk_info:
+        name: '{{ item.name | default(omit) }}'
+        moid: '{{ item.moid | default(omit) }}'
+      loop:
+        - {name: no-such-vm, expect: 'not found'}
+        - {name: '{{ vm }}', moid: '{{ info.vm.moid }}', expect: 'mutually exclusive'}
+        - {expect: 'one of the following is required'}
+      loop_control:
+        label: '{{ item.expect }}'
+      register: failures
+      ignore_errors: true
+
+    - name: Check the failures
+      ansible.builtin.assert:
+        that:
+          - item is failed
+          - item.item.expect in item.msg
+        fail_msg: '{{ item.item }} -> {{ item.msg | default(item) }}'
+      loop: '{{ failures.results }}'
+      loop_control:
+        label: '{{ item.item.expect }}'

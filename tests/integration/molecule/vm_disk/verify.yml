@@ -1,0 +1,44 @@
+---
+# Read both nodes back with vm_disk_info and check the layout, including that
+# the shared disks really are the same VMDK on both nodes (same backing UUID).
+- name: Verify the layout from node1
+  hosts: nodes
+  gather_facts: false
+  module_defaults:
+    group/git_cgallagher.vmware.vsphere: "{{ vsphere }}"
+  tasks:
+    - name: Read every node's disks
+      git_cgallagher.vmware.vm_disk_info:
+        name: "{{ item.value }}"
+      loop: "{{ sql_nodes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      register: vmware_info
+
+    - name: Check each node's layout
+      ansible.builtin.assert:
+        that:
+          # the OS disk, three per-node disks and the shared disks
+          - item.disks | length == 1 + sql_node_disks | length + sql_shared_disks | length
+          - item.disks | selectattr('controller_number', 'equalto', 1) | map(attribute='size_gb') | list
+            == sql_node_disks | map(attribute='size_gb') | list
+          - item.disks | selectattr('controller_number', 'equalto', 1) | map(attribute='type') | unique | list == ['thick']
+          - item.disks | selectattr('controller_number', 'equalto', 2) | map(attribute='filename') | list
+            == sql_shared_disks | map(attribute='name') | map('regex_replace', '$', '.vmdk') | map('regex_replace', '^', sql_shared_folder ~ '/') | list
+          - item.disks | selectattr('controller_number', 'equalto', 2) | map(attribute='sharing') | unique | list == ['multi_writer']
+          - item.disks | selectattr('controller_number', 'equalto', 2) | map(attribute='disk_mode') | unique | list == ['independent_persistent']
+          - (item.controllers | selectattr('bus_number', 'equalto', 2) | first).bus_sharing == 'physical'
+          - (item.controllers | selectattr('bus_number', 'equalto', 1) | first).bus_sharing == 'nosharing'
+        fail_msg: "{{ item.item.key }}: {{ item.disks }} {{ item.controllers }}"
+      loop: "{{ vmware_info.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    - name: Check the shared disks are the same files on every node
+      ansible.builtin.assert:
+        that:
+          - vmware_info.results | map(attribute='disks') | map('selectattr', 'controller_number', 'equalto', 2)
+            | map('map', attribute='uuid') | map('list') | unique | list | length == 1
+          - vmware_info.results[0].disks | selectattr('controller_number', 'equalto', 2) | map(attribute='uuid') | unique | list | length
+            == sql_shared_disks | length
+        fail_msg: "Shared disk UUIDs differ between nodes: {{ vmware_info.results | map(attribute='disks') | list }}"

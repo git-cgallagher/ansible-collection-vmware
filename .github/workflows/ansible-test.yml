@@ -1,0 +1,166 @@
+name: ansible-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly health check: dependency and runner changes show up between merges.
+  schedule:
+    - cron: '0 13 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PY_COLORS: '1'
+  ANSIBLE_FORCE_COLOR: '1'
+  # The pinned toolchain the molecule job runs in (.github/ci/runtime.sh): ansible-core,
+  # Molecule with the molecule-git-cgallagher driver, the docker CLI. The same tag and
+  # digest as the other git_cgallagher collections.
+  RUNTIME_IMAGE: ghcr.io/git-cgallagher/ansible-runtime:0.3.0-ci@sha256:87333cdf3144d89c974490a3c3d4996a03741ed79a07856b86299d1864674aec
+
+# Every job sets timeout-minutes: GitHub's default is 6 hours, and a stalled
+# install or image pull would hold the runner that long. Each limit is several
+# times the job's slowest green run (2026-11-01).
+jobs:
+  # Every merge to main is releasable (release.yml), so a PR that changes
+  # anything shipped in the collection must bump galaxy.yml's version and add
+  # a CHANGELOG entry. Galaxy versions can't be re-uploaded.
+  version-bump:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a version bump for shipped changes
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Paths that are NOT in the tarball (galaxy.yml build_ignore).
+          ignore='^(\.github/|tests/|AGENTS\.md$|\.ansible-lint$|\.yamllint$|\.gitignore$)'
+          shipped=$(git diff --name-only "$BASE"...HEAD | grep -Ev "$ignore" || true)
+          if [ -z "$shipped" ]; then echo "No shipped files changed; no release needed."; exit 0; fi
+          echo "Shipped files changed:"; echo "$shipped" | sed 's/^/  /'
+          ver() { python3 -c 'import sys,yaml; print(yaml.safe_load(sys.stdin)["version"])'; }
+          # The base of the very first PR has no galaxy.yml yet.
+          if git cat-file -e "$BASE:galaxy.yml" 2>/dev/null; then
+            old=$(git show "$BASE:galaxy.yml" | ver)
+          else
+            old=0.0.0
+          fi
+          new=$(ver < galaxy.yml)
+          if [ "$old" = "$new" ]; then
+            echo "::error file=galaxy.yml::Shipped content changed but version is still $old. Bump galaxy.yml (semver) and add a CHANGELOG.md entry."
+            exit 1
+          fi
+          python3 - "$old" "$new" <<'PY'
+          import sys
+          o, n = (tuple(int(x) for x in v.split('.')) for v in sys.argv[1:3])
+          sys.exit(0 if n > o else f"::error file=galaxy.yml::Version must increase ({sys.argv[1]} -> {sys.argv[2]})")
+          PY
+          grep -Eq "^## $new( |$)" CHANGELOG.md || { echo "::error file=CHANGELOG.md::No '## $new' entry"; exit 1; }
+          echo "OK: $old -> $new"
+
+  sanity:
+    name: sanity (${{ matrix.ansible-core-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        ansible-core-version: [stable-2.18, stable-2.19, stable-2.20, stable-2.21]
+    steps:
+      - uses: ansible-community/ansible-test-gh-action@6ded727edb598e670ac056a8e680ca4050bac0a3  # v1.18.0
+        with:
+          ansible-core-version: ${{ matrix.ansible-core-version }}
+          testing-type: sanity
+
+  # pytest over the pure helpers of module_utils/vsphere.py (tests/unit).
+  units:
+    name: units (${{ matrix.ansible-core-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        ansible-core-version: [stable-2.18, stable-2.19, stable-2.20, stable-2.21]
+    steps:
+      - uses: ansible-community/ansible-test-gh-action@6ded727edb598e670ac056a8e680ca4050bac0a3  # v1.18.0
+        with:
+          ansible-core-version: ${{ matrix.ansible-core-version }}
+          testing-type: units
+
+  # Real playbooks against vcsim, VMware's vCenter simulator, started inside
+  # the test container by tests/integration/targets/setup_vcsim/files/with_vcsim.sh (tests/integration).
+  # No vCenter, no credentials.
+  integration:
+    name: integration (${{ matrix.ansible-core-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        ansible-core-version: [stable-2.18, stable-2.19, stable-2.20, stable-2.21]
+    steps:
+      - uses: ansible-community/ansible-test-gh-action@6ded727edb598e670ac056a8e680ca4050bac0a3  # v1.18.0
+        with:
+          ansible-core-version: ${{ matrix.ansible-core-version }}
+          testing-type: integration
+
+  # The two-node SQL Server disk layout from a real remote host: a container
+  # over the docker connection, against vcsim in a second container, on the
+  # shared molecule-git-cgallagher driver (tests/integration/molecule/vm_disk).
+  # The integration targets above run the modules through the local connection.
+  molecule:
+    name: molecule vm_disk
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # A run that never releases a host hangs instead of failing, hence the limit.
+      - name: molecule test
+        timeout-minutes: 15
+        working-directory: tests/integration
+        run: ../../.github/ci/runtime.sh molecule test -s vm_disk
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.13'
+      - run: pip install ansible-core ansible-lint yamllint -r requirements.txt
+      - run: yamllint .
+      - run: ansible-lint
+
+  # The tarball Galaxy will get: builds, installs, and the plugin docs render.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.13'
+      - run: pip install ansible-core
+      - name: Build, install and render docs
+        run: |
+          ansible-galaxy collection build --force --output-path /tmp/dist
+          ansible-galaxy collection install /tmp/dist/git_cgallagher-vmware-*.tar.gz -p /tmp/colls --force
+          if tar tzf /tmp/dist/git_cgallagher-vmware-*.tar.gz | grep -E '^(tests|\.github)/'; then
+            echo "::error::Test or CI files leaked into the tarball"; exit 1
+          fi
+          ANSIBLE_COLLECTIONS_PATH=/tmp/colls ansible-doc -t module git_cgallagher.vmware.vm_disk > /dev/null
+          ANSIBLE_COLLECTIONS_PATH=/tmp/colls ansible-doc -t module git_cgallagher.vmware.vm_disk_info > /dev/null

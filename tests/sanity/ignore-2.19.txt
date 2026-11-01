@@ -1,0 +1,2 @@
+plugins/modules/vm_disk.py validate-modules:missing-gplv3-license # collection is MIT (GPLv3-compatible)
+plugins/modules/vm_disk_info.py validate-modules:missing-gplv3-license # collection is MIT (GPLv3-compatible)

@@ -1,0 +1,65 @@
+---
+# Disk layout for a two-node SQL Server cluster on vSphere: every node gets its
+# own data, log and tempdb disks (what an Always On availability group
+# replica needs), and both nodes attach the same quorum and data VMDKs on a
+# controller with physical bus sharing (what a failover cluster instance
+# needs). Run against vCenter with:
+#
+#   VMWARE_HOST=vcenter.example.com VMWARE_USER=svc-ansible@vsphere.local VMWARE_PASSWORD=... \
+#     ansible-playbook examples/sql_cluster_disks.yml
+#
+# Idempotent: a second run changes nothing. Shared disks are created by the
+# first node that asks for them and attached by the rest, through one task.
+- name: SQL Server cluster disks
+  hosts: localhost
+  gather_facts: false
+  vars:
+    sql_nodes: [sql01, sql02]
+    shared_folder: '[vsanDatastore] sqlfci'
+    node_disks:
+      - {name: data, unit_number: 0, size_gb: 200}
+      - {name: log, unit_number: 1, size_gb: 100}
+      - {name: tempdb, unit_number: 2, size_gb: 50}
+    shared_disks:
+      - {name: quorum, unit_number: 0, size_gb: 2}
+      - {name: sqldata, unit_number: 1, size_gb: 500}
+  tasks:
+    - name: Per-node disks on paravirtual controller 1
+      git_cgallagher.vmware.vm_disk:
+        name: "{{ item.0 }}"
+        controller_type: paravirtual
+        controller_number: 1
+        unit_number: "{{ item.1.unit_number }}"
+        size_gb: "{{ item.1.size_gb }}"
+        type: thick
+      loop: "{{ sql_nodes | product(node_disks) | list }}"
+      loop_control:
+        label: "{{ item.0 }} {{ item.1.name }}"
+
+    - name: Shared disks on paravirtual controller 2 with physical bus sharing
+      git_cgallagher.vmware.vm_disk:
+        name: "{{ item.0 }}"
+        controller_type: paravirtual
+        controller_number: 2
+        controller_bus_sharing: physical
+        unit_number: "{{ item.1.unit_number }}"
+        filename: "{{ shared_folder }}/{{ item.1.name }}.vmdk"
+        size_gb: "{{ item.1.size_gb }}"
+        type: eagerzeroedthick
+        disk_mode: independent_persistent
+        sharing: multi_writer
+      loop: "{{ sql_nodes | product(shared_disks) | list }}"
+      loop_control:
+        label: "{{ item.0 }} {{ item.1.name }}"
+
+    - name: Read the layout back
+      git_cgallagher.vmware.vm_disk_info:
+        name: "{{ item }}"
+      loop: "{{ sql_nodes }}"
+      register: layout
+
+    - name: The shared disks must be the same files on both nodes
+      ansible.builtin.assert:
+        that:
+          - layout.results | map(attribute='disks') | map('selectattr', 'controller_number', 'equalto', 2)
+            | map('map', attribute='uuid') | map('list') | unique | list | length == 1
