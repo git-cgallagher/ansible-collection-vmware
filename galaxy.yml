@@ -1,0 +1,35 @@
+namespace: git_cgallagher
+name: vmware
+version: 0.1.0
+readme: README.md
+authors:
+  - Chris Gallagher (@git-cgallagher)
+description: >-
+  vSphere automation for clustered workloads, starting with virtual disk and
+  SCSI controller management for SQL Server FCI and AAG guests. Tested in CI
+  against vcsim, the govmomi vCenter simulator.
+license:
+  - MIT
+tags:
+  - vmware
+  - vsphere
+  - vcenter
+  - cloud
+  - infrastructure
+  - sqlserver
+dependencies: {}
+repository: https://github.com/git-cgallagher/ansible-collection-vmware
+documentation: https://github.com/git-cgallagher/ansible-collection-vmware#readme
+issues: https://github.com/git-cgallagher/ansible-collection-vmware/issues
+build_ignore:
+  - .github
+  - .ansible
+  - .cache
+  - collections
+  - tests
+  - '*.tar.gz'
+  - .ansible-lint
+  - .yamllint
+  - .gitignore
+  - .pytest_cache
+  - AGENTS.md

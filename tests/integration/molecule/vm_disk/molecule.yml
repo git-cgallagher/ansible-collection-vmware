@@ -1,0 +1,74 @@
+---
+# A two-node SQL Server disk layout (AAG replicas with their own data, log and
+# tempdb disks, plus the shared quorum and data disks an FCI needs) laid down
+# by vm_disk from a real remote host. node1, a python:3.13-slim container
+# reached over the community.docker.docker connection, runs the module against
+# vcsim, VMware's vCenter simulator, in a second container on a shared Docker
+# network. The integration targets run the same modules through the local
+# connection; here Ansible ships them to another host, module_utils included,
+# and pyvmomi exists only on that host.
+#
+# Run it from tests/integration: `molecule test -s vm_disk` (AGENTS.md).
+# The platforms come from the molecule-git-cgallagher driver's docker kind.
+driver:
+  name: molecule-git-cgallagher
+  options:
+    # Both platforms join one network, created by the first and removed with
+    # the last; node1 reaches vcsim by its container name.
+    platform_defaults:
+      docker_networks:
+        - name: vmware-molecule
+      networks:
+        - name: vmware-molecule
+platforms:
+  # Built from ../../targets/setup_vcsim/files/Dockerfile (the single vcsim pin) for the host's
+  # architecture. Its CMD is the server, listening on 8989, so keep it:
+  # the kind's default command would be passed to vcsim as arguments.
+  - name: vcsim
+    image: vcsim-molecule:local
+    dockerfile: ../../targets/setup_vcsim/files/Dockerfile
+    pre_build_image: false
+    override_command: false
+    groups: [services]
+  - name: node1
+    image: docker.io/library/python:3.13-slim
+    groups: [nodes]
+provisioner:
+  name: ansible
+  env:
+    # .github/ci/runtime.sh links this checkout in as git_cgallagher.vmware
+    # under collections/ (gitignored, and in galaxy.yml's build_ignore).
+    ANSIBLE_COLLECTIONS_PATH: ${MOLECULE_PROJECT_DIRECTORY}/../../collections:~/.ansible/collections
+  inventory:
+    group_vars:
+      nodes:
+        # vcsim accepts any credentials; a throwaway placeholder.
+        vsphere:
+          hostname: vcsim
+          port: 8989
+          username: molecule
+          password: Example-not-secret
+          validate_certs: false
+        # vcsim's stock VMs stand in for the two SQL nodes.
+        sql_nodes:
+          sql1: DC0_H0_VM0
+          sql2: DC0_H0_VM1
+        # Per-node disks, the same on every replica (AAG) or node (FCI):
+        # paravirtual controller 1, thick.
+        sql_node_disks:
+          - {name: data, unit_number: 0, size_gb: 50}
+          - {name: log, unit_number: 1, size_gb: 25}
+          - {name: tempdb, unit_number: 2, size_gb: 20}
+        # Disks every node attaches (FCI): one VMDK each, on a paravirtual
+        # controller with physical bus sharing, eager-zeroed, multi-writer,
+        # independent so snapshots leave them alone.
+        sql_shared_disks:
+          - {name: quorum, unit_number: 0, size_gb: 2}
+          - {name: sqldata, unit_number: 1, size_gb: 100}
+        sql_shared_folder: '[LocalDS_0] sqlfci'
+verifier:
+  name: ansible
+scenario:
+  name: vm_disk
+  # No dependency step: everything the controller needs is in the runtime image.
+  test_sequence: [destroy, syntax, create, prepare, converge, idempotence, verify, destroy]

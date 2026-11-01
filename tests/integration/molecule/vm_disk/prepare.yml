@@ -1,0 +1,22 @@
+---
+# The modules' only dependency goes on the node, not the controller: if a
+# module ran anywhere but node1, it couldn't import pyvmomi.
+- name: Prepare the node
+  hosts: nodes
+  gather_facts: false
+  tasks:
+    # The driver doesn't wait for a container's service; vcsim takes a moment.
+    - name: Wait for vcsim
+      ansible.builtin.wait_for:
+        host: vcsim
+        port: 8989
+        timeout: 120
+
+    # The same floor as the collection's requirements.txt. pip directly:
+    # ansible.builtin.pip needs the packaging library on the node, which the
+    # slim image doesn't have.
+    - name: Install pyvmomi
+      ansible.builtin.command:
+        argv: [python3, -m, pip, install, --disable-pip-version-check, --root-user-action=ignore, pyvmomi>=9.0.0]
+      register: vmware_pip
+      changed_when: "'Successfully installed' in vmware_pip.stdout"
