@@ -1,0 +1,12 @@
+collections/
+.molecule-collections/
+.ansible/
+tests/output/
+*.tar.gz
+*.retry
+.cache/
+__pycache__/
+.DS_Store
+# Agent and session git worktrees live here; never commit them.
+.claude/worktrees/
+.pytest_cache/
