@@ -62,7 +62,13 @@ Python on this Mac is 3.14 only, so use `--docker default`.
 ansible-test sanity --docker default
 ansible-test units --docker default
 ansible-test integration --docker default      # ~1 min; downloads vcsim once per container
-yamllint . && ansible-lint
+yamllint . && ansible-lint                  # or: .github/ci/runtime.sh ansible-lint
+
+# Tool versions come from the ansible-runtime image RUNTIME_IMAGE pins (its shared dependency
+# model): lint, build and Molecule run in it, release.yml installs ansible-core from its
+# constraints.txt. Your own tools at CI's versions:
+#   docker run --rm "$RUNTIME_IMAGE" cat /usr/share/ansible-runtime/constraints.txt > /tmp/c.txt
+#   pip install -c /tmp/c.txt ansible-core ansible-lint yamllint -r requirements.txt
 
 # the Molecule scenario, exactly as CI runs it (needs Docker only)
 export RUNTIME_IMAGE=$(sed -n 's/^  RUNTIME_IMAGE: //p' .github/workflows/ansible-test.yml)
